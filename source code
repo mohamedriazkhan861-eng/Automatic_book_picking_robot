@@ -1,0 +1,302 @@
+Coding
+/************************************************************
+ * AUTOMATIC BOOK PICKING ROBOT – FINAL VERSION
+ * Board  : Arduino MEGA 2560
+ * Design : Small space demo
+ * Motion : Forward & backward only
+ * Search : Rotating arm + RFID
+ * Shelf  : Vertical lift servo control
+ * Arm    : 6 Servo Motors
+ ************************************************************/
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LiquidCrystal.h>
+#include <Servo.h>
+
+/* ================= FUNCTION DECLARATIONS ================= */
+void selectBook();
+void moveToRack();
+void followLineForward();
+void moveBackwardToStart();
+void moveToShelf(int shelf);
+void scanBooksWithArm();
+void pickBook();
+
+void moveForward();
+void moveBackward();
+void stopMotors();
+
+/* ================= RFID RC522 PINS (MEGA SPI) ================= */
+#define SS_PIN   53
+#define RST_PIN  49
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+/* ================= LCD PINS (MEGA) ================= */
+// RS, E, D4, D5, D6, D7
+LiquidCrystal lcd(30, 31, 32, 33, 34, 35);
+
+/* ================= BUTTON PINS ================= */
+#define BTN_NEXT    40
+#define BTN_PREV    41
+#define BTN_SELECT  42
+
+/* ================= LINE SENSOR PINS ================= */
+#define LINE_LEFT    A0
+#define LINE_CENTER  A1
+#define LINE_RIGHT   A2
+
+/* ================= L298N MOTOR DRIVER ================= */
+#define IN1 22
+#define IN2 23
+#define IN3 24
+#define IN4 25
+#define ENA 6
+#define ENB 7
+
+/* ================= 6 SERVO MOTORS ================= */
+Servo baseServo;       // base rotation
+Servo shoulderServo;   // shoulder up/down (shelf height)
+Servo elbowServo;      // elbow movement
+Servo wristRotate;     // wrist rotation
+Servo gripTilt;        // grip position (tilt)
+Servo gripperServo;    // open / close gripper
+
+#define BASE_SERVO_PIN      8
+#define SHOULDER_SERVO_PIN  9
+#define ELBOW_SERVO_PIN     10
+#define WRIST_SERVO_PIN     11
+#define GRIP_TILT_PIN       12
+#define GRIPPER_SERVO_PIN  13
+
+/* ================= BOOK DATABASE ================= */
+struct Book {
+  byte uid[4];
+  int rack;
+  int shelf;
+  const char* name;
+};
+
+Book books[] = {
+  {{0xE, 0x4B, 0xE2, 0x0}, 1, 1, "AI Basics"},
+  {{0xB2, 0x1A, 0x33, 0x90}, 2, 2, "Robotics"},
+  {{0xC1, 0x55, 0x88, 0x44}, 3, 3, "IoT"}
+};
+
+int totalBooks = sizeof(books) / sizeof(books[0]);
+int selectedBook = 0;
+int targetRack = 0;
+int rackCount = 0;
+bool bookConfirmed = false;
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(9600);
+
+  lcd.begin(16, 2);
+  lcd.print("Smart Library");
+  delay(2000);
+  lcd.clear();
+
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+
+  pinMode(LINE_LEFT, INPUT);
+  pinMode(LINE_CENTER, INPUT);
+  pinMode(LINE_RIGHT, INPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  baseServo.attach(BASE_SERVO_PIN);
+  shoulderServo.attach(SHOULDER_SERVO_PIN);
+  elbowServo.attach(ELBOW_SERVO_PIN);
+  wristRotate.attach(WRIST_SERVO_PIN);
+  gripTilt.attach(GRIP_TILT_PIN);
+  gripperServo.attach(GRIPPER_SERVO_PIN);
+
+  baseServo.write(90);
+  shoulderServo.write(50);
+  elbowServo.write(90);
+  wristRotate.write(90);
+  gripTilt.write(90);
+  gripperServo.write(90);
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  lcd.print("Select Book");
+}
+
+/* ================= MAIN LOOP ================= */
+void loop() {
+  if (!bookConfirmed) {
+    selectBook();
+  } else {
+    moveToRack();
+    moveToShelf(books[selectedBook].shelf);
+    scanBooksWithArm();
+    moveBackwardToStart();
+    bookConfirmed = false;
+    rackCount = 0;
+    lcd.clear();
+    lcd.print("Select Book");
+  }
+}
+
+/* ================= BOOK SELECTION ================= */
+void selectBook() {
+  lcd.setCursor(0, 0);
+  lcd.print("Select Book     ");
+  lcd.setCursor(0, 1);
+  lcd.print(books[selectedBook].name);
+
+  if (digitalRead(BTN_NEXT) == LOW) {
+    selectedBook = (selectedBook + 1) % totalBooks;
+    delay(300);
+  }
+  if (digitalRead(BTN_PREV) == LOW) {
+    selectedBook = (selectedBook - 1 + totalBooks) % totalBooks;
+    delay(300);
+  }
+  if (digitalRead(BTN_SELECT) == LOW) {
+    targetRack = books[selectedBook].rack;
+    bookConfirmed = true;
+    lcd.clear();
+    lcd.print("Book Selected");
+    delay(1000);
+  }
+}
+
+/* ================= MOVE TO RACK ================= */
+void moveToRack() {
+  lcd.clear();
+  lcd.print("Moving to Rack");
+
+  while (rackCount < targetRack) {
+    followLineForward();
+    if (digitalRead(LINE_LEFT) == LOW &&
+        digitalRead(LINE_CENTER) == LOW &&
+        digitalRead(LINE_RIGHT) == LOW) {
+      rackCount++;
+      delay(600);
+    }
+  }
+  stopMotors();
+}
+
+/* ================= LINE FOLLOW FORWARD ================= */
+void followLineForward() {
+  int L = digitalRead(LINE_LEFT);
+  int C = digitalRead(LINE_CENTER);
+  int R = digitalRead(LINE_RIGHT);
+
+  if (C == LOW) moveForward();
+  else if (L == LOW) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  }
+  else if (R == LOW) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  }
+  else stopMotors();
+}
+
+/* ================= MOVE TO SHELF HEIGHT ================= */
+void moveToShelf(int shelf) {
+  lcd.clear();
+  lcd.print("Shelf ");
+  lcd.print(shelf);
+
+  if (shelf == 1) shoulderServo.write(50);
+  if (shelf == 2) shoulderServo.write(75);
+  if (shelf == 3) shoulderServo.write(100);
+
+  delay(800);
+}
+
+/* ================= ARM SCAN & RFID ================= */
+void scanBooksWithArm() {
+  lcd.clear();
+  lcd.print("Scanning Books");
+
+  for (int angle = 40; angle <= 140; angle += 20) {
+    baseServo.write(angle);
+    wristRotate.write(angle);
+    delay(600);
+
+    if (!rfid.PICC_IsNewCardPresent()) continue;
+    if (!rfid.PICC_ReadCardSerial()) continue;
+
+    bool match = true;
+    for (byte i = 0; i < 4; i++) {
+      if (rfid.uid.uidByte[i] != books[selectedBook].uid[i]) {
+        match = false;
+        break;
+      }
+    }
+
+    if (match) {
+      lcd.clear();
+      lcd.print("Book Found");
+      pickBook();
+      break;
+    }
+  }
+}
+
+/* ================= PICK BOOK ================= */
+void pickBook() {
+  elbowServo.write(60);
+  delay(800);
+  gripTilt.write(100);
+  delay(400);
+  gripperServo.write(10);
+  delay(800);
+  elbowServo.write(90);
+}
+/* ================= RETURN TO START ================= */
+void moveBackwardToStart() {
+  lcd.clear();
+  lcd.print("Returning");
+
+  moveBackward();
+  delay(3000);
+  stopMotors();
+
+  lcd.clear();
+  lcd.print("Collect Book");
+}
+
+/* ================= MOTOR CONTROL ================= */
+void moveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 150);
+  analogWrite(ENB, 150);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 150);
+  analogWrite(ENB, 150);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
